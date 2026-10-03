@@ -5,6 +5,7 @@ Inicia sessió a app.wip29.com amb les credencials de l'usuari, descarrega les f
 
     streamlit run app.py
 """
+import json
 import re
 import time
 import unicodedata
@@ -16,6 +17,7 @@ import pandas as pd
 import plotly.express as px
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from bs4 import BeautifulSoup
 
 LOGIN_URL = "https://app.wip29.com/login"
@@ -56,6 +58,50 @@ METRICS = {  # nom -> (unitat, càlcul a partir de les sumes de RAW_COLUMNS)
 # Paleta validada per a daltonisme, en ordre fix: el període actual sempre és el blau.
 PALETTE_LIGHT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7"]
 PALETTE_DARK = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9"]
+
+# Gràfics: colors del tema per defecte de Streamlit, perquè el marc del gràfic no es noti
+CHART_HEIGHT = 380
+CHART_FONT = '"Source Sans 3", "Source Sans Pro", system-ui, sans-serif'
+CHART_THEMES = {False: dict(bg="#ffffff", text="#31333f", muted="#6b6f7e", grid="#e6eaf1"),
+                True: dict(bg="#0e1117", text="#fafafa", muted="#a3a8b8", grid="#31333f")}
+# Tooltip only while a finger/mouse is on a period: shown on touch or hover, hidden on lift,
+# on leaving, or when a vertical swipe turns into page scrolling (pointercancel).
+CHART_TEMPLATE = """<!doctype html><meta charset="utf-8">
+<style>
+  html, body { margin: 0; background: $BG; font-family: $FONT; color: $TEXT; }
+  #wrap { position: relative; }
+  #chart { touch-action: pan-y; }
+  #band { position: absolute; display: none; pointer-events: none; background: $TEXT; opacity: .08; }
+  #tip { position: absolute; display: none; pointer-events: none; z-index: 1; background: $BG;
+         border: 1px solid $GRID; border-radius: 8px; padding: 6px 10px; font-size: 13px; line-height: 1.5;
+         white-space: nowrap; box-shadow: 0 2px 8px rgba(0, 0, 0, .15); }
+  #tip .h { font-weight: 600; margin-bottom: 2px; }
+  #tip i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; }
+  #tip span { color: $MUTED; font-size: 11px; }
+</style>
+<div id="wrap">$PLOT<div id="band"></div><div id="tip"></div></div>
+<script>
+const TIPS = $TIPS, gd = document.getElementById("chart");
+const tip = document.getElementById("tip"), band = document.getElementById("band");
+function hide() { tip.style.display = band.style.display = "none"; }
+function show(e) {
+  const s = gd._fullLayout && gd._fullLayout._size;
+  const x = s ? e.clientX - gd.getBoundingClientRect().left - s.l : -1;
+  if (x < 0 || x >= s.w) return hide();
+  const w = s.w / TIPS.length, i = Math.floor(x / w);
+  band.style.cssText = `display:block;left:${s.l + i * w}px;width:${w}px;top:${s.t}px;height:${s.h}px`;
+  tip.innerHTML = TIPS[i];
+  tip.style.display = "block";
+  const left = s.l + (i + .5) * w - tip.offsetWidth / 2;
+  tip.style.left = Math.max(0, Math.min(left, gd.clientWidth - tip.offsetWidth)) + "px";
+  tip.style.top = s.t + "px";
+}
+gd.addEventListener("pointerdown", show);
+gd.addEventListener("pointermove", e => (e.pointerType === "mouse" || e.buttons) && show(e));
+gd.addEventListener("pointerup", e => e.pointerType !== "mouse" && hide());
+gd.addEventListener("pointercancel", hide);
+gd.addEventListener("pointerleave", hide);
+</script>"""
 
 
 class SessionExpired(Exception):
@@ -202,27 +248,38 @@ def metric_table(sums: pd.DataFrame, names: list[str]) -> pd.DataFrame:
     return pd.DataFrame({m: METRICS[m][1](sums) for m in names}, index=sums.index)
 
 
-def chart(table: pd.DataFrame, metric: str, colors: dict[str, str]):
-    unit = METRICS[metric][0]
-    n_labels = table["label"].nunique()
-    kwargs = dict(x="series" if n_labels == 1 else "label", y=metric, color="series",
-                  color_discrete_map=colors, custom_data=["dates"],
-                  category_orders={"series": list(colors)[::-1], "label": list(dict.fromkeys(table["label"]))})
-    if n_labels > 16:  # massa barres per llegir-les: línies
-        fig = px.line(table, **kwargs, markers=n_labels <= 60)
+def chart(table: pd.DataFrame, metric: str, colors: dict[str, str], dark: bool) -> str:
+    """A static chart (no zoom, scroll capture or toolbar) as HTML, plus a tooltip with every
+    year's value for a period that shows only while the finger or mouse is on that period."""
+    unit, theme = METRICS[metric][0], CHART_THEMES[dark]
+    x = "series" if table["label"].nunique() == 1 else "label"
+    periods = list(colors)[::-1] if x == "series" else list(dict.fromkeys(table["label"]))
+    kwargs = dict(x=x, y=metric, color="series", color_discrete_map=colors,
+                  category_orders={"series": list(colors)[::-1], "label": periods})
+    if len(periods) > 16:  # massa barres per llegir-les: línies
+        fig = px.line(table, **kwargs, markers=len(periods) <= 60)
         fig.update_traces(line_width=2, marker_size=8)
     else:
         fig = px.bar(table, **kwargs, barmode="group")
-    fig.update_traces(hovertemplate=f"%{{fullData.name}} · %{{customdata[0]}}: "
-                                    f"<b>%{{y:,.{2 if unit else 0}f}} {unit}</b><extra></extra>")
     fig.update_layout(
-        title=metric, separators=",.", height=380, hovermode="x unified",
-        xaxis_title=None, yaxis_title=None, yaxis_ticksuffix=f" {unit}" if unit else "",
+        template="plotly_dark" if dark else "plotly_white", paper_bgcolor=theme["bg"], plot_bgcolor=theme["bg"],
+        font=dict(family=CHART_FONT, color=theme["text"]), title=metric, separators=",.", height=CHART_HEIGHT,
+        xaxis_title=None, yaxis_title=None, yaxis_ticksuffix=f" {unit}" if unit else "", yaxis_gridcolor=theme["grid"],
         legend=dict(title=None, orientation="h", y=1.02, yanchor="bottom", x=1, xanchor="right"),
         bargap=0.25, bargroupgap=0.06, barcornerradius=4, margin=dict(l=8, r=8, t=56, b=8),
         xaxis_automargin=True, yaxis_automargin=True,
     )
-    return fig
+    rows = {}  # one tooltip per period: newest year first, as in the cards
+    for r in table.sort_values("offset").to_dict("records"):
+        rows.setdefault(r[x], []).append(
+            f'<div><i style="background:{colors[r["series"]]}"></i>{r["series"]} '
+            f'<b>{fmt(r[metric], unit)}</b> <span>{r["dates"]}</span></div>')
+    tips = [f'<div class="h">{period}</div>' + "".join(rows[period]) for period in periods]
+    plot = fig.to_html(full_html=False, include_plotlyjs="cdn", div_id="chart",
+                       config={"staticPlot": True, "responsive": True})
+    return (CHART_TEMPLATE.replace("$BG", theme["bg"]).replace("$TEXT", theme["text"])
+            .replace("$MUTED", theme["muted"]).replace("$GRID", theme["grid"]).replace("$FONT", CHART_FONT)
+            .replace("$PLOT", plot).replace("$TIPS", json.dumps(tips)))
 
 
 def reset_if_all() -> None:
@@ -363,7 +420,7 @@ def show_results(buckets: pd.DataFrame, sums: pd.DataFrame, title: str) -> None:
                 st.caption("  \n".join(lines))
 
     for m in metrics:
-        st.plotly_chart(chart(table, m, colors), width="stretch", config={"displaylogo": False})
+        components.html(chart(table, m, colors, dark), height=CHART_HEIGHT)
 
     with st.expander("Taula de dades"):
         chronological = table.sort_values(["offset", "idx"], ascending=[False, True])
