@@ -263,10 +263,13 @@ def chart(table: pd.DataFrame, metric: str, colors: dict[str, str], dark: bool) 
         fig = px.bar(table, **kwargs, barmode="group")
     fig.update_layout(
         template="plotly_dark" if dark else "plotly_white", paper_bgcolor=theme["bg"], plot_bgcolor=theme["bg"],
-        font=dict(family=CHART_FONT, color=theme["text"]), title=metric, separators=",.", height=CHART_HEIGHT,
+        font=dict(family=CHART_FONT, color=theme["text"]), separators=",.", height=CHART_HEIGHT,
         xaxis_title=None, yaxis_title=None, yaxis_ticksuffix=f" {unit}" if unit else "", yaxis_gridcolor=theme["grid"],
-        legend=dict(title=None, orientation="h", y=1.02, yanchor="bottom", x=1, xanchor="right"),
-        bargap=0.25, bargroupgap=0.06, barcornerradius=4, margin=dict(l=8, r=8, t=56, b=8),
+        # title on top, legend under it (left-aligned), so a long title never collides with the legend
+        title=dict(text=metric, x=0, xref="paper", y=1, yref="container", yanchor="top", pad=dict(t=8)),
+        legend=dict(title=None, orientation="h", x=0, xanchor="left", y=1 - 40 / CHART_HEIGHT,
+                    yref="container", yanchor="top"),
+        bargap=0.25, bargroupgap=0.06, barcornerradius=4, margin=dict(l=8, r=8, t=72, b=8),
         xaxis_automargin=True, yaxis_automargin=True,
     )
     rows = {}  # one tooltip per period: newest year first, as in the cards
