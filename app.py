@@ -14,10 +14,9 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 
 import pandas as pd
-import plotly.express as px
+import plotly.graph_objects as go
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
 from bs4 import BeautifulSoup
 
 LOGIN_URL = "https://app.wip29.com/login"
@@ -29,9 +28,20 @@ USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 MONTHS = ["gen", "febr", "març", "abr", "maig", "juny", "jul", "ag", "set", "oct", "nov", "des"]
 WEEKDAYS = ["dl", "dt", "dc", "dj", "dv", "ds", "dg"]
 GRANULARITIES = {"Dia": "D", "Setmana": "W", "Mes": "M", "Total del període": "T"}
+PERIODS = ["Dates", "Setmana", "Any", "Temporada"]  # com els filtres de taquilla de wip29
 FIRST_YEAR, LAST_YEAR = 2022, 2027  # anys amb dades a wip29
+MIN_DATE, MAX_DATE = date(FIRST_YEAR, 1, 1), date(LAST_YEAR, 12, 31)
+# Setmanes que es poden triar: de la del primer dia amb dades (dilluns) a la de l'últim (diumenge)
+WEEK_LIMITS = (MIN_DATE - timedelta(days=MIN_DATE.weekday()), MAX_DATE + timedelta(days=6 - MAX_DATE.weekday()))
 TZ = "Europe/Madrid"
 ALL, ALL_CURRENT = "Tots", "Tots els actuals"  # opcions especials del selector d'espectacles
+ALL_ROOMS = "Totes"  # opció del selector de sales
+# Les dues sales del teatre, com sigui que les anomeni wip29 ("CT", "Sala Cafè Teatre"...).
+# Clau: tros del nom en minúscules, sense accents, espais ni signes. Valor: (nom que es mostra, abreviació).
+ROOMS = {"cafeteatre": ("Sala Cafè-Teatre", "CT"), "xavierfabregas": ("Sala Xavier Fàbregas", "XF")}
+ROOM_CODES = dict(ROOMS.values())
+IMPRO = "improshow"  # Impro Show (com la clau de SHOW_ALIASES), per comparar-lo amb la resta d'espectacles
+REST = "Resta d'espectacles"
 
 # Sufix de temporada al final del nom: "2022-2024", "24-25", "2025/26", "(2025)", "Temporada 25-26"
 SEASON = re.compile(r"[\s(\-–·|,]*(?:\btemporada\b|\btemp\b\.?)?\s*"
@@ -55,33 +65,60 @@ METRICS = {  # nom -> (unitat, càlcul a partir de les sumes de RAW_COLUMNS)
     "Ocupació": ("%", lambda t: 100 * (t.paid + t.invitation) / t.capacity.where(t.capacity > 0)),
 }
 
-# Paleta validada per a daltonisme, en ordre fix: el període actual sempre és el blau.
-PALETTE_LIGHT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7"]
-PALETTE_DARK = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9"]
+# Paleta validada per a daltonisme, en ordre fix: el període actual sempre és el blau. Tots els anys es veuen
+# alhora (línies que es creuen, llegenda), així que l'ordre maximitza la distància entre qualsevol parell, no
+# només entre veïns: en mode clar, blau, vermell, verd, groc i lila es distingeixen tots entre ells.
+PALETTE_LIGHT = ["#2a78d6", "#e34948", "#008300", "#eda100", "#4a3aa7", "#eb6834", "#1baf7a"]
+PALETTE_DARK = ["#3987e5", "#e66767", "#008300", "#c98500", "#9085e9", "#d95926", "#199e70"]
 
 # Gràfics: colors del tema per defecte de Streamlit, perquè el marc del gràfic no es noti
-CHART_HEIGHT = 380
+CHART_PLOT = 300  # alçada de l'àrea de dibuix; el títol i les llegendes s'hi sumen
+LEGEND_ROW = 20  # alçada d'una línia de llegenda vertical
 CHART_FONT = '"Source Sans 3", "Source Sans Pro", system-ui, sans-serif'
 CHART_THEMES = {False: dict(bg="#ffffff", text="#31333f", muted="#6b6f7e", grid="#e6eaf1"),
                 True: dict(bg="#0e1117", text="#fafafa", muted="#a3a8b8", grid="#31333f")}
+CHART_CONFIG = {"staticPlot": True, "responsive": True}
 # Tooltip only while a finger/mouse is on a period: shown on touch or hover, hidden on lift,
 # on leaving, or when a vertical swipe turns into page scrolling (pointercancel).
+# The theme can change without the server knowing (Streamlit's settings menu), so the chart watches the
+# page's background and swaps to the other theme's figure and colours when it changes.
 CHART_TEMPLATE = """<!doctype html><meta charset="utf-8">
 <style>
-  html, body { margin: 0; background: $BG; font-family: $FONT; color: $TEXT; }
+  :root { $CSS }
+  html, body { margin: 0; overflow: hidden; background: var(--bg); font-family: $FONT; color: var(--text); }
   #wrap { position: relative; }
   #chart { touch-action: pan-y; }
-  #band { position: absolute; display: none; pointer-events: none; background: $TEXT; opacity: .08; }
-  #tip { position: absolute; display: none; pointer-events: none; z-index: 1; background: $BG;
-         border: 1px solid $GRID; border-radius: 8px; padding: 6px 10px; font-size: 13px; line-height: 1.5;
+  #band { position: absolute; display: none; pointer-events: none; background: var(--text); opacity: .08; }
+  #tip { position: absolute; display: none; pointer-events: none; z-index: 1; background: var(--bg);
+         border: 1px solid var(--grid); border-radius: 8px; padding: 6px 10px; font-size: 13px; line-height: 1.5;
          white-space: nowrap; box-shadow: 0 2px 8px rgba(0, 0, 0, .15); }
   #tip .h { font-weight: 600; margin-bottom: 2px; }
-  #tip i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; }
-  #tip span { color: $MUTED; font-size: 11px; }
+  #tip i { display: inline-block; box-sizing: border-box; width: 10px; height: 10px; border: 2px solid;
+           border-radius: 2px; margin-right: 6px; }
+  #tip span { color: var(--muted); font-size: 11px; }
 </style>
 <div id="wrap">$PLOT<div id="band"></div><div id="tip"></div></div>
 <script>
-const TIPS = $TIPS, gd = document.getElementById("chart");
+const TIPS = $TIPS, FIGS = $FIGS, THEMES = $THEMES, gd = document.getElementById("chart");
+let dark = $DARK;
+function pageIsDark() {
+  try {
+    const doc = window.parent.document;
+    for (const el of [doc.querySelector(".stApp"), doc.body]) {
+      const [r, g, b, a = 1] = ((el && getComputedStyle(el).backgroundColor.match(/[\\d.]+/g)) || []).map(Number);
+      if (r !== undefined && a > 0) return .299 * r + .587 * g + .114 * b < 128;
+    }
+  } catch (e) {}  // the page can't be read: keep the server's guess
+  return dark;
+}
+function follow() {
+  if (pageIsDark() === dark) return;
+  dark = !dark;
+  for (const [k, v] of Object.entries(THEMES[+dark])) document.documentElement.style.setProperty(k, v);
+  Plotly.react(gd, FIGS[+dark].data, FIGS[+dark].layout, $CONFIG);
+}
+follow();
+setInterval(follow, 500);
 const tip = document.getElementById("tip"), band = document.getElementById("band");
 function hide() { tip.style.display = band.style.display = "none"; }
 function show(e) {
@@ -129,6 +166,11 @@ def barcelona_today() -> date:
     return pd.Timestamp.now(TZ).date()
 
 
+def season_year(d: date) -> int:
+    """Year its wip29 season (1 September - 31 August) starts: 6/10/2026 -> 2026, 6/3/2026 -> 2025."""
+    return d.year - (d.month < 9)
+
+
 @st.cache_data(ttl="1d", max_entries=100, show_spinner=False)
 def fetch_year(_http: requests.Session, email: str, year: int, loaded_at: float) -> list[dict]:
     """Every performance of one calendar year. `email` keys the cache, so accounts never share it;
@@ -154,6 +196,17 @@ def show_name(activity: str) -> str:
     return next((alias for part, alias in SHOW_ALIASES.items() if part in squash(name)), name)
 
 
+def room_name(*names) -> str:
+    """The room of a performance from the names wip29 gives it (`theater`, `calendar`): one of ROOMS if any
+    of them is one, in whatever spelling; otherwise the first name given."""
+    names = [n.strip() for n in names if isinstance(n, str) and n.strip()]
+    for key in map(squash, names):
+        for part, (room, code) in ROOMS.items():
+            if part in key or key in (code.lower(), "sala" + code.lower()):
+                return room
+    return names[0] if names else "Sense sala"
+
+
 @st.cache_data(ttl="1d", max_entries=20, show_spinner=False)
 def load_events(_http: requests.Session, email: str, loaded_at: float) -> pd.DataFrame:
     """Every performance from FIRST_YEAR to LAST_YEAR: one request per year, in parallel.
@@ -164,15 +217,16 @@ def load_events(_http: requests.Session, email: str, loaded_at: float) -> pd.Dat
         this_year = barcelona_today().year
         batches = pool.map(lambda y: fetch_year(_http, email, y, loaded_at if y >= this_year else 0), years)
         events = [e for batch in batches for e in batch]
-    df = pd.DataFrame(events, columns=["id", "activity", "start", *RAW_COLUMNS[1:]]).drop_duplicates("id")
+    df = pd.DataFrame(events, columns=["id", "activity", "start", "theater", "calendar", *RAW_COLUMNS[1:]]
+                      ).drop_duplicates("id")
     df[RAW_COLUMNS[1:]] = df[RAW_COLUMNS[1:]].apply(pd.to_numeric, errors="coerce").fillna(0)
     # Variants of one name ("Los Hijos" / "Los Hijos.") become its most common spelling
     names = df["activity"].map(show_name)
     keys = names.map(squash)
     spelling = names.groupby(keys).agg(lambda s: s.value_counts().index[0])
-    return df.assign(shows=1, activity=keys.map(spelling),
+    return df.assign(shows=1, activity=keys.map(spelling), room=list(map(room_name, df["theater"], df["calendar"])),
                      day=pd.to_datetime(df["start"]).dt.normalize()
-                     ).drop(columns=["id", "start"])
+                     ).drop(columns=["id", "start", "theater", "calendar"])
 
 
 # ---------------------------------------------------------------- periods
@@ -210,12 +264,13 @@ def bucket_label(d: date, gran: str, with_year: bool) -> str:
             "T": "Total"}[gran]
 
 
-def plan(start: date, end: date, gran: str, years_back: int) -> pd.DataFrame:
-    """One row per (year offset, bucket): its dates and how to label it."""
+def plan(start: date, end: date, gran: str, years_back: int, season: bool = False) -> pd.DataFrame:
+    """One row per (year offset, bucket): its dates and how to label it. A season is always named
+    as one ("2026–2027"), even when cut short at today."""
     base = split(start, end, gran)
     rows = []
     for k in range(years_back + 1):
-        a, b = start.year - k, end.year - k
+        a, b = start.year - k, (start.year + 1 if season else end.year) - k
         shifted = split(shift_back(start, k, gran), shift_back(end, k, gran, is_end=True), gran)
         for idx, ((bs, _), (s, e)) in enumerate(zip(base, shifted)):
             rows.append({"offset": k, "idx": idx, "start": s, "end": e,
@@ -248,41 +303,95 @@ def metric_table(sums: pd.DataFrame, names: list[str]) -> pd.DataFrame:
     return pd.DataFrame({m: METRICS[m][1](sums) for m in names}, index=sums.index)
 
 
-def chart(table: pd.DataFrame, metric: str, colors: dict[str, str], dark: bool) -> str:
-    """A static chart (no zoom, scroll capture or toolbar) as HTML, plus a tooltip with every
-    year's value for a period that shows only while the finger or mouse is on that period."""
+def change(now: float, then: float) -> str:
+    """' · ▲ +12,3 %' in green or ' · ▼ -4,5 %' in red: how `now` compares with `then`."""
+    if not then or pd.isna(then) or pd.isna(now):
+        return ""
+    pct = (now - then) / abs(then) * 100
+    arrow, color = ("▲", "green") if pct >= 0 else ("▼", "red")
+    return f" · :{color}[{arrow} {pct:+.1f} %]".replace(".", ",")
+
+
+def figure(table: pd.DataFrame, metric: str, dark: bool) -> go.Figure:
+    """One metric's chart in one theme: a colour per year, the current one first in the palette. With two groups
+    of shows (Impro Show and the rest) the second is empty (hollow bars; dashed lines with empty circles), and the
+    legend has two columns: the years by colour, and the groups by marker, in the colour of the text."""
     unit, theme = METRICS[metric][0], CHART_THEMES[dark]
+    series = list(dict.fromkeys(table.sort_values("offset")["series"]))  # newest first, as in the cards
+    color = dict(zip(series, PALETTE_DARK if dark else PALETTE_LIGHT))
+    groups = list(dict.fromkeys(table["group"]))
+    two = len(groups) > 1
     x = "series" if table["label"].nunique() == 1 else "label"
-    periods = list(colors)[::-1] if x == "series" else list(dict.fromkeys(table["label"]))
-    kwargs = dict(x=x, y=metric, color="series", color_discrete_map=colors,
-                  category_orders={"series": list(colors)[::-1], "label": periods})
-    if len(periods) > 16:  # massa barres per llegir-les: línies
-        fig = px.line(table, **kwargs, markers=len(periods) <= 60)
-        fig.update_traces(line_width=2, marker_size=8)
-    else:
-        fig = px.bar(table, **kwargs, barmode="group")
+    periods = series[::-1] if x == "series" else list(dict.fromkeys(table["label"]))
+    lines = len(periods) * len(groups) > 16  # massa barres per llegir-les: línies
+    markers = lines and len(periods) <= 60
+    fig = go.Figure()
+    for s in series[::-1]:  # oldest first, from left to right
+        for g, group in enumerate(groups):
+            y = table[(table["series"] == s) & (table["group"] == group)].set_index(x)[metric].reindex(periods)
+            empty, c = g > 0, color[s]
+            if lines:
+                fig.add_scatter(x=periods, y=y, name=s, showlegend=not two, mode="lines+markers" if markers else "lines",
+                                line=dict(color=c, width=2, dash="dash" if empty else "solid"),
+                                marker=dict(color=c, size=8, symbol="circle-open" if empty else "circle",
+                                            line_width=2 if empty else 0))
+            else:  # side by side per year and group; with a bar per year ("Total del període"), per group only
+                fig.add_bar(x=periods, y=y, name=s, showlegend=not two, offsetgroup=g if x == "series" else f"{s}{g}",
+                            marker=dict(color=theme["bg"] if empty else c, line=dict(color=c, width=2 if empty else 0)))
+    if two:  # data traces stay out of the legend: two columns of entries without data instead
+        for s in series:
+            fig.add_scatter(x=[None], y=[None], name=s, mode="markers", legend="legend",
+                            marker=dict(color=color[s], size=12, symbol="square"))
+        for g, group in enumerate(groups):
+            fig.add_scatter(x=[None], y=[None], name=group, mode="lines+markers" if lines else "markers",
+                            legend="legend2", line=dict(color=theme["text"], width=2, dash="dash" if g else "solid"),
+                            marker=dict(color=theme["text"], size=10, symbol="circle-open" if g else "circle",
+                                        line_width=2 if g else 0))
+    top = 40 + (max(len(series), len(groups)) * LEGEND_ROW if two else 24) + 8  # title, legend
+    height = CHART_PLOT + top + 8
+    legend = dict(title=None, orientation="v" if two else "h", x=0, xanchor="left", y=1 - 40 / height,
+                  yref="container", yanchor="top", tracegroupgap=0)
     fig.update_layout(
         template="plotly_dark" if dark else "plotly_white", paper_bgcolor=theme["bg"], plot_bgcolor=theme["bg"],
-        font=dict(family=CHART_FONT, color=theme["text"]), separators=",.", height=CHART_HEIGHT,
-        xaxis_title=None, yaxis_title=None, yaxis_ticksuffix=f" {unit}" if unit else "", yaxis_gridcolor=theme["grid"],
+        font=dict(family=CHART_FONT, color=theme["text"]), separators=",.", height=height,
+        xaxis=dict(type="category", categoryorder="array", categoryarray=periods, title=None, automargin=True),
+        yaxis=dict(title=None, ticksuffix=f" {unit}" if unit else "", gridcolor=theme["grid"], automargin=True),
         # title on top, legend under it (left-aligned), so a long title never collides with the legend
         title=dict(text=metric, x=0, xref="paper", y=1, yref="container", yanchor="top", pad=dict(t=8)),
-        legend=dict(title=None, orientation="h", x=0, xanchor="left", y=1 - 40 / CHART_HEIGHT,
-                    yref="container", yanchor="top"),
-        bargap=0.25, bargroupgap=0.06, barcornerradius=4, margin=dict(l=8, r=8, t=72, b=8),
-        xaxis_automargin=True, yaxis_automargin=True,
+        legend=legend, **(dict(legend2=legend | dict(x=0.5)) if two else {}),
+        barmode="group", bargap=0.25, bargroupgap=0.06, barcornerradius=4, margin=dict(l=8, r=8, t=top, b=8),
     )
-    rows = {}  # one tooltip per period: newest year first, as in the cards
-    for r in table.sort_values("offset").to_dict("records"):
+    return fig
+
+
+def chart(table: pd.DataFrame, metric: str, dark: bool) -> tuple[str, int]:
+    """A static chart (no zoom, scroll capture or toolbar) as HTML, and its height, plus a tooltip with every
+    year's value for a period that shows only while the finger or mouse is on that period. It carries both
+    themes and follows the page's (`dark` is only the server's guess, for the first paint)."""
+    unit = METRICS[metric][0]
+    figs = [figure(table, metric, d) for d in (False, True)]
+    series = list(dict.fromkeys(table.sort_values("offset")["series"]))
+    groups = list(dict.fromkeys(table["group"]))
+    x = "series" if table["label"].nunique() == 1 else "label"
+    rows = {}  # one tooltip per period: newest year first, as in the cards; the second group, an empty square
+    for r in table.sort_values(["offset", "g"]).to_dict("records"):
+        c = f"var(--s{series.index(r['series'])})"
         rows.setdefault(r[x], []).append(
-            f'<div><i style="background:{colors[r["series"]]}"></i>{r["series"]} '
+            f'<div><i style="border-color:{c}{"" if r["g"] else f";background:{c}"}"></i>{r["series"]}'
+            f'{" · " + r["group"] if len(groups) > 1 else ""} '
             f'<b>{fmt(r[metric], unit)}</b> <span>{r["dates"]}</span></div>')
+    periods = series[::-1] if x == "series" else list(dict.fromkeys(table["label"]))
     tips = [f'<div class="h">{period}</div>' + "".join(rows[period]) for period in periods]
-    plot = fig.to_html(full_html=False, include_plotlyjs="cdn", div_id="chart",
-                       config={"staticPlot": True, "responsive": True})
-    return (CHART_TEMPLATE.replace("$BG", theme["bg"]).replace("$TEXT", theme["text"])
-            .replace("$MUTED", theme["muted"]).replace("$GRID", theme["grid"]).replace("$FONT", CHART_FONT)
-            .replace("$PLOT", plot).replace("$TIPS", json.dumps(tips)))
+    themes = [{f"--{k}": v for k, v in CHART_THEMES[d].items()}
+              | {f"--s{i}": c for i, c in enumerate(PALETTE_DARK if d else PALETTE_LIGHT)} for d in (False, True)]
+    plot = figs[dark].to_html(full_html=False, include_plotlyjs="cdn", div_id="chart", config=CHART_CONFIG)
+    script_safe = lambda s: s.replace("</", "<\/")  # nothing inside a <script> may close it
+    html = (CHART_TEMPLATE.replace("$CSS", "; ".join(f"{k}: {v}" for k, v in themes[dark].items()))
+            .replace("$FONT", CHART_FONT).replace("$PLOT", plot).replace("$DARK", json.dumps(dark))
+            .replace("$CONFIG", json.dumps(CHART_CONFIG)).replace("$THEMES", json.dumps(themes))
+            .replace("$FIGS", script_safe(f"[{figs[0].to_json()}, {figs[1].to_json()}]"))
+            .replace("$TIPS", script_safe(json.dumps(tips))))
+    return html, figs[dark].layout.height
 
 
 def reset_if_all() -> None:
@@ -325,6 +434,50 @@ def login_page() -> None:
     st.rerun()
 
 
+def snap_week(key: str) -> None:
+    """Picking any day in "Des de" or "Fins a" picks its whole week: the Monday and the Sunday."""
+    day = st.session_state[key]
+    monday = day - timedelta(days=day.weekday())
+    st.session_state.week_start, st.session_state.week_end = monday, monday + timedelta(days=6)
+
+
+def step_week(weeks: int) -> None:
+    monday = st.session_state.week_start + timedelta(weeks=weeks)
+    if WEEK_LIMITS[0] <= monday <= WEEK_LIMITS[1] - timedelta(days=6):
+        st.session_state.week_start, st.session_state.week_end = monday, monday + timedelta(days=6)
+
+
+def pick_period(period: str, today: date, c1, c2) -> tuple[date, date]:
+    """First and last day of the period picked as in wip29: a date range (that "Fins avui" ends today),
+    a week (Monday to Sunday), a month, a natural year or a season."""
+    limits = dict(min_value=MIN_DATE, max_value=MAX_DATE, format="DD/MM/YYYY")
+    if period == "Dates":
+        start = c1.date_input("Des de", date(today.year, 1, 1), **limits)
+        end_box = c2.container()  # the toggle decides the date input, but sits below it
+        until_today = c2.toggle("Fins avui")
+        end = end_box.date_input("Fins a", today, **limits, disabled=until_today, key=f"end_{until_today}")
+        # always the current date, even if the app stays open past midnight
+        return start, today if until_today else end
+    if period == "Setmana":  # el calendari no pot amagar dies: qualsevol dia tria la seva setmana sencera
+        monday = today - timedelta(days=today.weekday())
+        st.session_state.setdefault("week_start", monday)
+        st.session_state.setdefault("week_end", monday + timedelta(days=6))
+        week = dict(min_value=WEEK_LIMITS[0], max_value=WEEK_LIMITS[1], format="DD/MM/YYYY", on_change=snap_week)
+        start = c1.date_input("Des de", key="week_start", args=("week_start",), **week)
+        end = c2.date_input("Fins a", key="week_end", args=("week_end",), **week)
+        c1.button("◀", on_click=step_week, args=(-1,), width="stretch")
+        c2.button("▶", on_click=step_week, args=(1,), width="stretch")
+        return max(start, MIN_DATE), end  # la setmana de l'1/1/2022 comença el 2021, sense dades
+    if period == "Any":
+        year = c1.selectbox("Any", range(FIRST_YEAR, LAST_YEAR + 1), index=today.year - FIRST_YEAR)
+        start, end = date(year, 1, 1), date(year, 12, 31)
+    else:
+        year = c1.selectbox("Temporada", range(FIRST_YEAR, LAST_YEAR + 1), index=season_year(today) - FIRST_YEAR,
+                            format_func=lambda y: f"{y}/{y + 1}")
+        start, end = date(year, 9, 1), date(year + 1, 8, 31)
+    return start, end
+
+
 def dashboard() -> None:
     head, refresh, out = st.columns([4, 1, 1], vertical_alignment="bottom")
     head.title("Comparativa de taquilla")
@@ -347,45 +500,57 @@ def dashboard() -> None:
         return
 
     today = barcelona_today()
-    limits = dict(min_value=date(FIRST_YEAR, 1, 1), max_value=date(LAST_YEAR, 12, 31), format="DD/MM/YYYY")
+    top_left, top_right = st.columns([3, 2])
+    period = top_left.segmented_control("Període", PERIODS, default=PERIODS[0], required=True, key="period")
+    rooms = sorted(set(events["room"]), key=lambda r: (r not in ROOM_CODES, r))  # CT i XF primer
+    room = top_right.segmented_control("Sala", [ALL_ROOMS, *rooms], default=ALL_ROOMS, required=True, key="room",
+                                       format_func=lambda r: ROOM_CODES.get(r, r)) if len(rooms) > 1 else ALL_ROOMS
     c1, c2, c3, c4 = st.columns(4)
-    start = c1.date_input("Des de", date(today.year, 1, 1), **limits)
-    end_box = c2.container()  # the toggle decides the date input, but sits below it
-    until_today = c2.toggle("Fins avui")
-    end = end_box.date_input("Fins a", today, **limits, disabled=until_today, key=f"end_{until_today}")
-    if until_today:
-        end = today  # always the current date, even if the app stays open past midnight
-    gran = GRANULARITIES[c3.selectbox("Agrupa per", list(GRANULARITIES), index=2)]
+    start, end = pick_period(period, today, c1, c2)
+    # Cada tipus de període recorda la seva agrupació; una setmana, per defecte per dies
+    gran = GRANULARITIES[c3.selectbox("Agrupa per", list(GRANULARITIES), key=f"gran_{period}",
+                                      index=0 if period == "Setmana" else 2)]
+    # Actuals: amb alguna funció a la temporada de wip29 en curs (1 de setembre - 31 d'agost)
+    season_start = pd.Timestamp(season_year(today), 9, 1)
+    current = set(events.loc[events["day"].between(season_start, season_start + pd.DateOffset(years=1, days=-1)),
+                             "activity"])
+    past = set(events["activity"]) - current
+    impro_name = next((s for s in current | past if squash(s) == IMPRO), "Impro Show")
+    impro = st.toggle(f"{impro_name} vs resta", key="impro")
     max_back = min(len(PALETTE_LIGHT) - 1, start.year - FIRST_YEAR)  # no data before FIRST_YEAR
     # At the maximum until the user moves it; then their choice, capped to what fits
     chosen = st.session_state.get("years_back") if st.session_state.get("years_moved") else max_back
     st.session_state["years_back"] = min(chosen, max_back)
-    years_back = st.slider("Anys anteriors a comparar", 0, max_back, key="years_back",
+    years_back = st.slider("Anys anteriors a comparar", 0, max_back, key="years_back", width=240,
                            on_change=lambda: st.session_state.update(years_moved=True)) if max_back else 0
     if start > end:
         st.error("La data d'inici és posterior a la data final.")
         return
-    # Actuals: amb alguna funció a la temporada de wip29 en curs (1 de setembre - 31 d'agost)
-    season_start = pd.Timestamp(today.year - (today.month < 9), 9, 1)
-    current = set(events.loc[events["day"].between(season_start, season_start + pd.DateOffset(years=1, days=-1)),
-                             "activity"])
-    past = set(events["activity"]) - current
     options = [ALL, ALL_CURRENT, *sorted(current, key=squash), *sorted(past, key=squash)]
     picked = c4.multiselect("Espectacle", options, key="shows", on_change=reset_if_all, select_all=False,
-                            format_func=lambda s: f"{s} (antic)" if s in past else s, placeholder=ALL)
-    exclude = c4.toggle("Exclou els triats", disabled=not picked)
+                            format_func=lambda s: f"{s} (antic)" if s in past else s, placeholder=ALL, disabled=impro)
+    exclude = c4.toggle("Exclou els triats", disabled=not picked or impro)
     shows = set(picked) - {ALL_CURRENT} | (current if ALL_CURRENT in picked else set())
-    if picked:
-        events = events[events["activity"].isin(shows) != exclude]
-    title = "Tots els espectacles" if not picked else ("Tots excepte " if exclude else "") + ", ".join(picked)
-    buckets = plan(start, end, gran, years_back)
-    show_results(buckets, bucketize(events, buckets), title)
+    if room != ALL_ROOMS:
+        events = events[events["room"] == room]
+    if impro:  # dues parts de cada període: Impro Show i la resta d'espectacles
+        is_impro = events["activity"].map(squash) == IMPRO
+        groups = {impro_name: events[is_impro], REST: events[~is_impro]}
+        title = f"{impro_name} vs resta d'espectacles"
+    else:
+        groups = {"": events[events["activity"].isin(shows) != exclude] if picked else events}
+        title = "Tots els espectacles" if not picked else ("Tots excepte " if exclude else "") + ", ".join(picked)
+    buckets = plan(start, end, gran, years_back, season=period == "Temporada")
+    show_results(buckets, {name: bucketize(group, buckets) for name, group in groups.items()},
+                 title + ("" if room == ALL_ROOMS else f" · {room}"))
 
 
-def show_results(buckets: pd.DataFrame, sums: pd.DataFrame, title: str) -> None:
+def show_results(buckets: pd.DataFrame, parts: dict[str, pd.DataFrame], title: str) -> None:
+    """Cards, charts and table, one series per year. `parts` holds the sums of each group of shows: one group,
+    or two (Impro Show and the rest), and then the cards give the first one's figures and its share of the total."""
     st.divider()
     st.subheader(title)
-    if not sums["shows"].any():
+    if not any(sums["shows"].any() for sums in parts.values()):
         st.warning("No hi ha dades d'aquests espectacles en aquest període.")
         return
     metrics = st.multiselect("Mètriques", list(METRICS), default=["Recaptació", "Espectadors totals"])
@@ -394,41 +559,51 @@ def show_results(buckets: pd.DataFrame, sums: pd.DataFrame, title: str) -> None:
         return
 
     series = list(dict.fromkeys(buckets["series"]))  # ordenat per offset: actual primer
-    dark = getattr(getattr(st.context, "theme", None), "type", None) == "dark"
-    colors = dict(zip(series, PALETTE_DARK if dark else PALETTE_LIGHT))
+    dark = getattr(getattr(st.context, "theme", None), "type", None) == "dark"  # first guess; the charts check
+    main, *others = parts
 
-    table = buckets.join(metric_table(sums, metrics).reset_index(drop=True))
+    table = pd.concat([buckets.join(metric_table(sums, metrics).reset_index(drop=True)).assign(group=name, g=g)
+                       for g, (name, sums) in enumerate(parts.items())], ignore_index=True)
 
     # Xifres clau: el període triat en gran i, a sota, cada any anterior amb la variació respecte a ell
-    totals = metric_table(sums.groupby(level="offset").sum(), metrics)
-    if len(series) > 1:
+    # (i, si es compara Impro Show amb la resta, la part del total de cada any que és seva)
+    totals = {name: metric_table(sums.groupby(level="offset").sum(), metrics) for name, sums in parts.items()}
+    if others:
+        of = "d'" if main[:1].lower() in "aeiouhàèéíòóú" else "de "
+        st.caption(f"Les xifres grans són {of}{main}; «del total» és la seva part del total"
+                   + (f", i les fletxes, la variació de {series[0]} respecte a cada any." if len(series) > 1 else "."))
+    elif len(series) > 1:
         st.caption(f"Els percentatges són la variació de {series[0]} respecte a cada any.")
     cols = []
     for i, m in enumerate(metrics):
-        unit, now = METRICS[m][0], totals.loc[0, m]
-        lines = []
+        unit, now = METRICS[m][0], totals[main].loc[0, m]
+        whole = sum(t[m] for t in totals.values())  # per any
+        share = lambda k: (f" · {totals[main].loc[k, m] / whole.loc[k] * 100:.1f} % del total".replace(".", ",")
+                           if others and unit != "%" and whole.loc[k] else "")  # l'ocupació no se suma
+        lines = [f"**{name}** · {fmt(totals[name].loc[0, m], unit)}" for name in others]
+        if share(0):
+            lines.append(f"**{main}**{share(0)}")
         for k in range(1, len(series)):
-            then = totals.loc[k, m]
-            line = f"**{series[k]}** · {fmt(then, unit)}"
-            if then and pd.notna(then) and pd.notna(now):
-                pct = (now - then) / abs(then) * 100
-                arrow, color = ("▲", "green") if pct >= 0 else ("▼", "red")
-                line += f" · :{color}[{arrow} {pct:+.1f} %]".replace(".", ",")
-            lines.append(line)
-        if i % 2 == 0:
-            cols = st.columns(2)  # two cards per row; each row its own columns so rows line up
-        with cols[i % 2].container(border=True):
-            st.metric(f"{m} · {series[0]}", fmt(now, unit))
+            then = totals[main].loc[k, m]
+            lines.append(f"**{series[k]}** · {fmt(then, unit)}{change(now, then)}{share(k)}" + "".join(
+                f" · resta {fmt(t.loc[k, m], unit)}{change(t.loc[0, m], t.loc[k, m])}" for t in map(totals.get, others)))
+        per_row = 1 if others else 2  # Impro Show vs resta: lines too long for half a row
+        if i % per_row == 0:
+            cols = st.columns(per_row)  # each row its own columns so rows line up
+        with cols[i % per_row].container(border=True):
+            st.metric(f"{m} · {main + ' · ' if others else ''}{series[0]}", fmt(now, unit))
             if lines:
                 st.caption("  \n".join(lines))
 
     for m in metrics:
-        components.html(chart(table, m, colors, dark), height=CHART_HEIGHT)
+        html, height = chart(table, m, dark)
+        st.iframe(html, height=height)
 
     with st.expander("Taula de dades"):
-        chronological = table.sort_values(["offset", "idx"], ascending=[False, True])
-        st.dataframe(chronological.drop(columns=["offset", "idx", "start", "end"]).rename(
-            columns={"series": "Any", "label": "Període", "dates": "Dates"}),
+        chronological = table.sort_values(["offset", "g", "idx"], ascending=[False, True, True])
+        columns = ["series", *(["group"] if others else []), "label", "dates", *metrics]
+        st.dataframe(chronological[columns].rename(
+            columns={"series": "Any", "group": "Espectacles", "label": "Període", "dates": "Dates"}),
             width="stretch", hide_index=True)
 
 
