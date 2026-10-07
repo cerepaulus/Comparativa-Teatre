@@ -29,11 +29,12 @@ MONTHS = ["gen", "febr", "març", "abr", "maig", "juny", "jul", "ag", "set", "oc
 WEEKDAYS = ["dl", "dt", "dc", "dj", "dv", "ds", "dg"]
 GRANULARITIES = {"Dia": "D", "Setmana": "W", "Mes": "M", "Total del període": "T"}
 PERIODS = ["Dates", "Setmana", "Any", "Temporada"]  # com els filtres de taquilla de wip29
-FIRST_YEAR, LAST_YEAR = 2022, 2027  # anys amb dades a wip29
+TZ = "Europe/Madrid"
+# Anys que es descarreguen: des del primer amb dades a wip29 fins a l'any vinent, que ja té entrades venudes
+FIRST_YEAR, LAST_YEAR = 2022, pd.Timestamp.now(TZ).year + 1
 MIN_DATE, MAX_DATE = date(FIRST_YEAR, 1, 1), date(LAST_YEAR, 12, 31)
 # Setmanes que es poden triar: de la del primer dia amb dades (dilluns) a la de l'últim (diumenge)
 WEEK_LIMITS = (MIN_DATE - timedelta(days=MIN_DATE.weekday()), MAX_DATE + timedelta(days=6 - MAX_DATE.weekday()))
-TZ = "Europe/Madrid"
 ALL, ALL_CURRENT = "Tots", "Tots els actuals"  # opcions especials del selector d'espectacles
 ALL_ROOMS = "Totes"  # opció del selector de sales
 # Les dues sales del teatre, com sigui que les anomeni wip29 ("CT", "Sala Cafè Teatre"...).
@@ -219,27 +220,41 @@ def load_events(_http: requests.Session, email: str, loaded_at: float) -> pd.Dat
         events = [e for batch in batches for e in batch]
     df = pd.DataFrame(events, columns=["id", "activity", "start", "theater", "calendar", *RAW_COLUMNS[1:]]
                       ).drop_duplicates("id")
-    df[RAW_COLUMNS[1:]] = df[RAW_COLUMNS[1:]].apply(pd.to_numeric, errors="coerce").fillna(0)
+    numbers = df[RAW_COLUMNS[1:]].apply(pd.to_numeric, errors="coerce")
+    unreadable = int((numbers.isna() & df[RAW_COLUMNS[1:]].notna()).sum().sum())  # sent, but not a number
+    df[RAW_COLUMNS[1:]] = numbers.fillna(0)
     # Variants of one name ("Los Hijos" / "Los Hijos.") become its most common spelling
     names = df["activity"].map(show_name)
     keys = names.map(squash)
     spelling = names.groupby(keys).agg(lambda s: s.value_counts().index[0])
-    return df.assign(shows=1, activity=keys.map(spelling), room=list(map(room_name, df["theater"], df["calendar"])),
-                     day=pd.to_datetime(df["start"]).dt.normalize()
-                     ).drop(columns=["id", "start", "theater", "calendar"])
+    # A performance without a single ticket (cancelled, or not sold yet) is not a funció and its seats don't count
+    # for occupancy; its money, if any, still does
+    sold = df["paid"] + df["invitation"] > 0
+    df = df.assign(shows=sold.astype(int), capacity=df["capacity"].where(sold, 0), activity=keys.map(spelling),
+                   room=list(map(room_name, df["theater"], df["calendar"])),
+                   day=pd.to_datetime(df["start"]).dt.normalize()).drop(columns=["id", "start", "theater", "calendar"])
+    df.attrs["unreadable"] = unreadable
+    return df
 
 
 # ---------------------------------------------------------------- periods
 
-def shift_back(d: date, years: int, gran: str, is_end: bool = False) -> date:
-    """Same date N years earlier. Days/weeks go back 52 weeks so weekdays line up."""
-    if gran in ("D", "W"):
-        return d - timedelta(weeks=52 * years)
+def shift_back(d: date, years: int, is_end: bool = False) -> date:
+    """Same date N years earlier."""
     y = d.year - years
     last = monthrange(y, d.month)[1]
     if is_end and d.day == monthrange(d.year, d.month)[1]:
         return date(y, d.month, last)  # final de mes -> final de mes (febrers de traspàs)
     return date(y, d.month, min(d.day, last))
+
+
+def shift(start: date, end: date, years: int, gran: str) -> tuple[date, date]:
+    """The same period N years earlier. By days or weeks it moves back whole weeks, so weekdays line up: as many
+    as land nearest the same dates (at most 3 days off, however many years back). Otherwise, the same dates."""
+    if gran in ("D", "W"):
+        back = timedelta(weeks=round((start - shift_back(start, years)).days / 7))
+        return start - back, end - back
+    return shift_back(start, years), shift_back(end, years, is_end=True)
 
 
 def split(start: date, end: date, gran: str) -> list[tuple[date, date]]:
@@ -271,7 +286,7 @@ def plan(start: date, end: date, gran: str, years_back: int, season: bool = Fals
     rows = []
     for k in range(years_back + 1):
         a, b = start.year - k, (start.year + 1 if season else end.year) - k
-        shifted = split(shift_back(start, k, gran), shift_back(end, k, gran, is_end=True), gran)
+        shifted = split(*shift(start, end, k, gran), gran)
         for idx, ((bs, _), (s, e)) in enumerate(zip(base, shifted)):
             rows.append({"offset": k, "idx": idx, "start": s, "end": e,
                          "series": str(a) if a == b else f"{a}–{b}",
@@ -303,19 +318,26 @@ def metric_table(sums: pd.DataFrame, names: list[str]) -> pd.DataFrame:
     return pd.DataFrame({m: METRICS[m][1](sums) for m in names}, index=sums.index)
 
 
-def change(now: float, then: float) -> str:
-    """' · ▲ +12,3 %' in green or ' · ▼ -4,5 %' in red: how `now` compares with `then`."""
+def change(now: float, then: float, unit: str) -> str:
+    """' · ▲ +12,3 %' in green or ' · ▼ -4,5 %' in red: how `now` compares with `then`. A percentage (occupancy)
+    changes in points: 50 % -> 55 % is +5 points, not +10 %."""
     if not then or pd.isna(then) or pd.isna(now):
         return ""
-    pct = (now - then) / abs(then) * 100
-    arrow, color = ("▲", "green") if pct >= 0 else ("▼", "red")
-    return f" · :{color}[{arrow} {pct:+.1f} %]".replace(".", ",")
+    diff = now - then if unit == "%" else (now - then) / abs(then) * 100
+    arrow, color = ("▲", "green") if diff >= 0 else ("▼", "red")
+    return f" · :{color}[{arrow} {diff:+.1f} {'punts' if unit == '%' else '%'}]".replace(".", ",")
+
+
+def uses_lines(table: pd.DataFrame) -> bool:
+    """Too many bars to read (periods × groups of shows > 16): a line chart."""
+    periods = table["label"].nunique() if table["label"].nunique() > 1 else table["series"].nunique()
+    return periods * table["group"].nunique() > 16
 
 
 def figure(table: pd.DataFrame, metric: str, dark: bool) -> go.Figure:
     """One metric's chart in one theme: a colour per year, the current one first in the palette. With two groups
-    of shows (Impro Show and the rest) the second is empty (hollow bars; dashed lines with empty circles), and the
-    legend has two columns: the years by colour, and the groups by marker, in the colour of the text."""
+    of shows (Impro Show and the rest) the second is striped (bars) or dashed with empty circles (lines), and the
+    legend has two columns: the years by colour, and the groups by their look, in the colour of the text."""
     unit, theme = METRICS[metric][0], CHART_THEMES[dark]
     series = list(dict.fromkeys(table.sort_values("offset")["series"]))  # newest first, as in the cards
     color = dict(zip(series, PALETTE_DARK if dark else PALETTE_LIGHT))
@@ -323,8 +345,11 @@ def figure(table: pd.DataFrame, metric: str, dark: bool) -> go.Figure:
     two = len(groups) > 1
     x = "series" if table["label"].nunique() == 1 else "label"
     periods = series[::-1] if x == "series" else list(dict.fromkeys(table["label"]))
-    lines = len(periods) * len(groups) > 16  # massa barres per llegir-les: línies
+    lines = uses_lines(table)
     markers = lines and len(periods) <= 60
+    # side by side per year and group; with a bar per year ("Total del període"), per group only
+    slot = lambda s, g: g if x == "series" else f"{s}{g}"
+    stripes = lambda g, c: dict(color=c, pattern=dict(shape="/" if g else "", fillmode="overlay", solidity=0.5))
     fig = go.Figure()
     for s in series[::-1]:  # oldest first, from left to right
         for g, group in enumerate(groups):
@@ -335,18 +360,21 @@ def figure(table: pd.DataFrame, metric: str, dark: bool) -> go.Figure:
                                 line=dict(color=c, width=2, dash="dash" if empty else "solid"),
                                 marker=dict(color=c, size=8, symbol="circle-open" if empty else "circle",
                                             line_width=2 if empty else 0))
-            else:  # side by side per year and group; with a bar per year ("Total del període"), per group only
-                fig.add_bar(x=periods, y=y, name=s, showlegend=not two, offsetgroup=g if x == "series" else f"{s}{g}",
-                            marker=dict(color=theme["bg"] if empty else c, line=dict(color=c, width=2 if empty else 0)))
+            else:
+                fig.add_bar(x=periods, y=y, name=s, showlegend=not two, offsetgroup=slot(s, g), marker=stripes(g, c))
     if two:  # data traces stay out of the legend: two columns of entries without data instead
         for s in series:
             fig.add_scatter(x=[None], y=[None], name=s, mode="markers", legend="legend",
                             marker=dict(color=color[s], size=12, symbol="square"))
         for g, group in enumerate(groups):
-            fig.add_scatter(x=[None], y=[None], name=group, mode="lines+markers" if lines else "markers",
-                            legend="legend2", line=dict(color=theme["text"], width=2, dash="dash" if g else "solid"),
-                            marker=dict(color=theme["text"], size=10, symbol="circle-open" if g else "circle",
-                                        line_width=2 if g else 0))
+            if lines:
+                fig.add_scatter(x=[None], y=[None], name=group, mode="lines+markers", legend="legend2",
+                                line=dict(color=theme["text"], width=2, dash="dash" if g else "solid"),
+                                marker=dict(color=theme["text"], size=10, symbol="circle-open" if g else "circle",
+                                            line_width=2 if g else 0))
+            else:  # a bar without data, in a slot that exists already, so it moves no bar: its legend entry shows
+                fig.add_bar(x=[None], y=[None], name=group, legend="legend2", offsetgroup=slot(series[0], g),
+                            marker=stripes(g, theme["text"]))
     top = 40 + (max(len(series), len(groups)) * LEGEND_ROW if two else 24) + 8  # title, legend
     height = CHART_PLOT + top + 8
     legend = dict(title=None, orientation="v" if two else "h", x=0, xanchor="left", y=1 - 40 / height,
@@ -373,11 +401,14 @@ def chart(table: pd.DataFrame, metric: str, dark: bool) -> tuple[str, int]:
     series = list(dict.fromkeys(table.sort_values("offset")["series"]))
     groups = list(dict.fromkeys(table["group"]))
     x = "series" if table["label"].nunique() == 1 else "label"
-    rows = {}  # one tooltip per period: newest year first, as in the cards; the second group, an empty square
+    # one tooltip per period, newest year first as in the cards; the second group's square as in the chart:
+    # empty (lines) or striped (bars)
+    rest = "transparent" if uses_lines(table) else "repeating-linear-gradient(135deg, {c} 0 2px, transparent 2px 4px)"
+    rows = {}
     for r in table.sort_values(["offset", "g"]).to_dict("records"):
         c = f"var(--s{series.index(r['series'])})"
         rows.setdefault(r[x], []).append(
-            f'<div><i style="border-color:{c}{"" if r["g"] else f";background:{c}"}"></i>{r["series"]}'
+            f'<div><i style="border-color:{c};background:{rest.format(c=c) if r["g"] else c}"></i>{r["series"]}'
             f'{" · " + r["group"] if len(groups) > 1 else ""} '
             f'<b>{fmt(r[metric], unit)}</b> <span>{r["dates"]}</span></div>')
     periods = series[::-1] if x == "series" else list(dict.fromkeys(table["label"]))
@@ -385,7 +416,7 @@ def chart(table: pd.DataFrame, metric: str, dark: bool) -> tuple[str, int]:
     themes = [{f"--{k}": v for k, v in CHART_THEMES[d].items()}
               | {f"--s{i}": c for i, c in enumerate(PALETTE_DARK if d else PALETTE_LIGHT)} for d in (False, True)]
     plot = figs[dark].to_html(full_html=False, include_plotlyjs="cdn", div_id="chart", config=CHART_CONFIG)
-    script_safe = lambda s: s.replace("</", "<\/")  # nothing inside a <script> may close it
+    script_safe = lambda s: s.replace("</", "<\\/")  # nothing inside a <script> may close it
     html = (CHART_TEMPLATE.replace("$CSS", "; ".join(f"{k}: {v}" for k, v in themes[dark].items()))
             .replace("$FONT", CHART_FONT).replace("$PLOT", plot).replace("$DARK", json.dumps(dark))
             .replace("$CONFIG", json.dumps(CHART_CONFIG)).replace("$THEMES", json.dumps(themes))
@@ -472,7 +503,8 @@ def pick_period(period: str, today: date, c1, c2) -> tuple[date, date]:
         year = c1.selectbox("Any", range(FIRST_YEAR, LAST_YEAR + 1), index=today.year - FIRST_YEAR)
         start, end = date(year, 1, 1), date(year, 12, 31)
     else:
-        year = c1.selectbox("Temporada", range(FIRST_YEAR, LAST_YEAR + 1), index=season_year(today) - FIRST_YEAR,
+        # only seasons that end within the downloaded years
+        year = c1.selectbox("Temporada", range(FIRST_YEAR, LAST_YEAR), index=season_year(today) - FIRST_YEAR,
                             format_func=lambda y: f"{y}/{y + 1}")
         start, end = date(year, 9, 1), date(year + 1, 8, 31)
     return start, end
@@ -499,6 +531,9 @@ def dashboard() -> None:
         st.error(f"Error en descarregar les dades de wip29: {exc}")
         return
 
+    if unreadable := events.attrs.get("unreadable"):
+        st.warning(f"wip29 ha enviat {unreadable} xifres que no són números: compten com a 0, i els totals poden "
+                   "ser incorrectes.")
     today = barcelona_today()
     top_left, top_right = st.columns([3, 2])
     period = top_left.segmented_control("Període", PERIODS, default=PERIODS[0], required=True, key="period")
@@ -517,7 +552,11 @@ def dashboard() -> None:
     past = set(events["activity"]) - current
     impro_name = next((s for s in current | past if squash(s) == IMPRO), "Impro Show")
     impro = st.toggle(f"{impro_name} vs resta", key="impro")
-    max_back = min(len(PALETTE_LIGHT) - 1, start.year - FIRST_YEAR)  # no data before FIRST_YEAR
+    # Only years whose whole period has data: wip29's records start on the first day with a performance, and a
+    # period starting earlier would show its missing days as zeros, as if nothing had been sold
+    first_day = events["day"].min().date() if len(events) else MIN_DATE
+    max_back = max((k for k in range(1, len(PALETTE_LIGHT)) if shift(start, end, k, gran)[0] >= first_day),
+                   default=0)
     # At the maximum until the user moves it; then their choice, capped to what fits
     chosen = st.session_state.get("years_back") if st.session_state.get("years_moved") else max_back
     st.session_state["years_back"] = min(chosen, max_back)
@@ -568,12 +607,13 @@ def show_results(buckets: pd.DataFrame, parts: dict[str, pd.DataFrame], title: s
     # Xifres clau: el període triat en gran i, a sota, cada any anterior amb la variació respecte a ell
     # (i, si es compara Impro Show amb la resta, la part del total de cada any que és seva)
     totals = {name: metric_table(sums.groupby(level="offset").sum(), metrics) for name, sums in parts.items()}
+    points = " (l'ocupació, en punts)" if "Ocupació" in metrics else ""
     if others:
         of = "d'" if main[:1].lower() in "aeiouhàèéíòóú" else "de "
-        st.caption(f"Les xifres grans són {of}{main}; «del total» és la seva part del total"
-                   + (f", i les fletxes, la variació de {series[0]} respecte a cada any." if len(series) > 1 else "."))
+        st.caption(f"Les xifres grans són {of}{main}; «del total» és la seva part del total" + (
+            f", i les fletxes, la variació de {series[0]} respecte a cada any{points}." if len(series) > 1 else "."))
     elif len(series) > 1:
-        st.caption(f"Els percentatges són la variació de {series[0]} respecte a cada any.")
+        st.caption(f"Els percentatges són la variació de {series[0]} respecte a cada any{points}.")
     cols = []
     for i, m in enumerate(metrics):
         unit, now = METRICS[m][0], totals[main].loc[0, m]
@@ -585,8 +625,9 @@ def show_results(buckets: pd.DataFrame, parts: dict[str, pd.DataFrame], title: s
             lines.append(f"**{main}**{share(0)}")
         for k in range(1, len(series)):
             then = totals[main].loc[k, m]
-            lines.append(f"**{series[k]}** · {fmt(then, unit)}{change(now, then)}{share(k)}" + "".join(
-                f" · resta {fmt(t.loc[k, m], unit)}{change(t.loc[0, m], t.loc[k, m])}" for t in map(totals.get, others)))
+            lines.append(f"**{series[k]}** · {fmt(then, unit)}{change(now, then, unit)}{share(k)}" + "".join(
+                f" · resta {fmt(t.loc[k, m], unit)}{change(t.loc[0, m], t.loc[k, m], unit)}"
+                for t in map(totals.get, others)))
         per_row = 1 if others else 2  # Impro Show vs resta: lines too long for half a row
         if i % per_row == 0:
             cols = st.columns(per_row)  # each row its own columns so rows line up
